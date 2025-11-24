@@ -146,6 +146,8 @@ public class MecanumAuto extends LinearOpMode {
                     tagOfInterest = detections.get(0).id;
                     telemetry.addData("TagOfInterest", tagOfInterest + " (fallback)");
                 }
+                // Also report the seen tag as an integer for driver station clarity
+                telemetry.addData("SeenTagInt", tagOfInterest == null ? -1 : tagOfInterest);
             } else {
                 telemetry.addData("TagOfInterest", tagOfInterest == null ? "None" : tagOfInterest);
             }
@@ -249,9 +251,28 @@ public class MecanumAuto extends LinearOpMode {
             } else {
                 // 2) Fire 3 rings/balls by pulsing the feeder
                 for (int i = 0; i < 3 && opModeIsActive(); i++) {
+                    // Show launcher RPMs while feeding so drivers can monitor
+                    double vTopNow = launcherTop.getVelocity();
+                    double vBottomNow = launcherBottom.getVelocity();
+                    double rpmTopNow = vTopNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    double rpmBottomNow = vBottomNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    telemetry.addData("Feeding", "shot %d", i+1);
+                    telemetry.addData("RPMTop", "%.1f", rpmTopNow);
+                    telemetry.addData("RPMBottom", "%.1f", rpmBottomNow);
+                    telemetry.update();
+
                     feeder.setPower(0.9);
                     sleep(500); // feed duration (tune to reliably feed one projectile)
                     feeder.setPower(0.0);
+                    // Update RPMs after feeding pulse
+                    vTopNow = launcherTop.getVelocity();
+                    vBottomNow = launcherBottom.getVelocity();
+                    rpmTopNow = vTopNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    rpmBottomNow = vBottomNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    telemetry.addData("PostFeedRPMTop", "%.1f", rpmTopNow);
+                    telemetry.addData("PostFeedRPMBottom", "%.1f", rpmBottomNow);
+                    telemetry.update();
+
                     sleep(300); // pause between feeds
                 }
 
@@ -449,8 +470,14 @@ public class MecanumAuto extends LinearOpMode {
             double errTop = Math.abs(vTop - targetTicksPerSec);
             double errBottom = Math.abs(vBottom - targetTicksPerSec);
 
-            telemetry.addData("LauncherVelTop", "%.1f", vTop);
-            telemetry.addData("LauncherVelBottom", "%.1f", vBottom);
+            // Convert ticks/sec -> RPM for driver-friendly display
+            double rpmTop = vTop * 60.0 / TICKS_PER_MOTOR_REV;
+            double rpmBottom = vBottom * 60.0 / TICKS_PER_MOTOR_REV;
+
+            telemetry.addData("LauncherVelTop", "%.1f t/s", vTop);
+            telemetry.addData("LauncherVelBottom", "%.1f t/s", vBottom);
+            telemetry.addData("LauncherRPMTop", "%.1f rpm", rpmTop);
+            telemetry.addData("LauncherRPMBottom", "%.1f rpm", rpmBottom);
             telemetry.addData("ErrTop", "%.1f", errTop);
             telemetry.addData("ErrBottom", "%.1f", errBottom);
             telemetry.addData("DeltaTop", "%.2f", dvTop);
@@ -526,4 +553,3 @@ public class MecanumAuto extends LinearOpMode {
     }
 
 }
-
