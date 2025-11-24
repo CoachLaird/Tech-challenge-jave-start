@@ -1,0 +1,571 @@
+package org.firstinspires.ftc.teamcode;
+
+import com.qualcomm.robotcore.eventloop.opmode.Autonomous;
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.util.ElapsedTime;
+import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+import org.openftc.easyopencv.OpenCvCamera;
+import org.openftc.easyopencv.OpenCvCameraFactory;
+import org.openftc.easyopencv.OpenCvCameraRotation;
+import org.openftc.easyopencv.OpenCvPipeline;
+import org.openftc.easyopencv.OpenCvWebcam;
+import org.opencv.core.Mat;
+
+@Autonomous(name = "blue java test auto", group = "Auto")
+public class MecanumAuto extends LinearOpMode {
+
+    // Drive motors
+    private DcMotorEx frontLeft, frontRight, backLeft, backRight;
+
+    // Launcher motors (no gearbox) - run at max power for launch
+    private DcMotorEx launcherTop, launcherBottom;
+
+    // Feeder motor (25:1 gearbox)
+    private DcMotorEx feeder;
+
+    // Tunable physical constants - adjust for your robot
+    private static final double WHEEL_DIAMETER_INCHES = 3.0; // wheel diameter
+    private static final double TICKS_PER_MOTOR_REV = 28.0; // encoder ticks per motor revolution (adjust if different)
+    private static final double DRIVE_GEAR_REDUCTION = 20.0; // 20:1 ultraplanetary gearbox on drive motors
+    private static final double FEEDER_GEAR_REDUCTION = 25.0; // feeder gearbox 25:1
+    private static final double LAUNCHER_TARGET_RPM = 6000.0; // target launcher speed
+
+    // Robot geometry - used for turning. Tune this value for accurate rotation.
+    private static final double TRACK_WIDTH_INCHES = 17.0; // approximate distance between left and right wheels
+
+    private double COUNTS_PER_INCH;
+
+    private ElapsedTime runtime = new ElapsedTime();
+
+    // Webcam for AprilTag detection (Microsoft LifeCam)
+    private OpenCvWebcam webcam;
+    private AprilTagDetectionPipeline cameraPipeline;
+    private Integer tagOfInterest = null; // ID of detected tag to use for autonomous decision
+    // 2025 "Decode" game AprilTag IDs (adjust if your field uses different IDs)
+    private static final int[] GAME_TAG_IDS = {20, 21, 22, 23, 24};
+    // Human-readable labels for the game tags (customize as needed)
+    private static final java.util.Map<Integer, String> GAME_TAG_LABELS;
+    static {
+        GAME_TAG_LABELS = new java.util.HashMap<>();
+        GAME_TAG_LABELS.put(20, "Blue Target");
+        GAME_TAG_LABELS.put(21, "Motif");
+        GAME_TAG_LABELS.put(22, "Motif");
+        GAME_TAG_LABELS.put(23, "Motif");
+        GAME_TAG_LABELS.put(24, "Red Target");
+    }
+    private static final double MIN_LAUNCH_DISTANCE_METERS = 11.0 * 0.3048; // 11 ft in meters (~3.3528 m)
+
+    @Override
+    public void runOpMode() {
+        // Hardware map - update names to match your configuration
+        frontLeft = hardwareMap.get(DcMotorEx.class, "fl");
+        frontRight = hardwareMap.get(DcMotorEx.class, "fr");
+        backLeft = hardwareMap.get(DcMotorEx.class, "bl");
+        backRight = hardwareMap.get(DcMotorEx.class, "br");
+
+        launcherTop = hardwareMap.get(DcMotorEx.class, "launcher_top");
+        launcherBottom = hardwareMap.get(DcMotorEx.class, "launcher_bottom");
+
+        feeder = hardwareMap.get(DcMotorEx.class, "feeder");
+
+        // Set directions - adjust if motors are mounted differently
+        frontLeft.setDirection(DcMotor.Direction.FORWARD);
+        backLeft.setDirection(DcMotor.Direction.FORWARD);
+        frontRight.setDirection(DcMotor.Direction.REVERSE);
+        backRight.setDirection(DcMotor.Direction.REVERSE);
+
+        // Launcher directions - usually opposite so both shoot forward
+        launcherTop.setDirection(DcMotor.Direction.FORWARD);
+        launcherBottom.setDirection(DcMotor.Direction.REVERSE);
+
+        feeder.setDirection(DcMotor.Direction.FORWARD);
+
+        // Reset encoders
+        frontLeft.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+        frontRight.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+        backLeft.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+        backRight.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        frontRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+
+        // Compute counts per inch for drive (motor ticks * gearbox) / wheel circumference
+        double ticksPerWheelRev = TICKS_PER_MOTOR_REV * DRIVE_GEAR_REDUCTION;
+        COUNTS_PER_INCH = ticksPerWheelRev / (Math.PI * WHEEL_DIAMETER_INCHES);
+
+        telemetry.addData("Status", "Initialized");
+        telemetry.addData("CountsPerInch", COUNTS_PER_INCH);
+        telemetry.update();
+
+        // --- Camera init (Microsoft Lifecam) ---
+        int cameraMonitorViewId = hardwareMap.appContext.getResources()
+                .getIdentifier("cameraMonitorViewId", "id", hardwareMap.appContext.getPackageName());
+
+        try {
+            WebcamName webcamName = hardwareMap.get(WebcamName.class, "webcam");
+            webcam = OpenCvCameraFactory.getInstance().createWebcam(webcamName, cameraMonitorViewId);
+
+            // Example camera intrinsics (fx, fy, cx, cy) - replace with calibrated values for best results
+            double fx = 600; // focal length x (pixels)
+            double fy = 600; // focal length y (pixels)
+            double cx = 320; // principal point x (pixels)
+            double cy = 240; // principal point y (pixels)
+            double tagSizeMeters = 0.165; // size of the AprilTag in meters (16.5cm)
+
+            cameraPipeline = new AprilTagDetectionPipeline(tagSizeMeters, fx, fy, cx, cy);
+            webcam.setPipeline(cameraPipeline);
+            webcam.openCameraDeviceAsync(new OpenCvCamera.AsyncCameraOpenListener() {
+                @Override
+                public void onOpened() {
+                    webcam.startStreaming(640, 480, OpenCvCameraRotation.UPRIGHT);
+                }
+
+                @Override
+                public void onError(int errorCode) {
+                    telemetry.addData("Camera", "Open error: %d", errorCode);
+                    telemetry.update();
+                }
+            });
+        } catch (Exception e) {
+            telemetry.addData("Camera", "Init failed: %s", e.getMessage());
+            telemetry.update();
+        }
+
+        // During init, show detections and pick a tag of interest (if any)
+        while (!isStarted() && !isStopRequested()) {
+            java.util.List<AprilTagDetectionPipeline.Detection> detections = cameraPipeline == null ? java.util.Collections.emptyList() : cameraPipeline.getLatestDetections();
+            telemetry.addData("Detections", detections.size());
+            if (!detections.isEmpty()) {
+                // Prefer any of the 2025 game tags; fall back to the first seen tag otherwise.
+                java.util.Set<Integer> gameIdsSet = new java.util.HashSet<>();
+                for (int id : GAME_TAG_IDS) gameIdsSet.add(id);
+                String ids = "";
+                Integer foundTarget = null;
+                for (AprilTagDetectionPipeline.Detection d : detections) {
+                    ids += d.id + " ";
+                    if (gameIdsSet.contains(d.id)) {
+                        foundTarget = d.id; // prefer the first game tag seen
+                        break;
+                    }
+                }
+                telemetry.addData("IDs", ids);
+                if (foundTarget != null) {
+                    tagOfInterest = foundTarget; // prefer one of the configured game tag IDs
+                    telemetry.addData("TagOfInterest", tagOfInterest + " (game tag: " + GAME_TAG_LABELS.getOrDefault(tagOfInterest, "N/A") + ")");
+                } else {
+                    // fallback to first seen tag if no known game tag is visible
+                    tagOfInterest = detections.get(0).id;
+                    telemetry.addData("TagOfInterest", tagOfInterest + " (fallback)");
+                }
+                telemetry.addData("SeenTagLabel", GAME_TAG_LABELS.getOrDefault(tagOfInterest, "UNKNOWN"));
+                // Also report the seen tag as an integer for driver station clarity
+                telemetry.addData("SeenTagInt", tagOfInterest == null ? -1 : tagOfInterest);
+            } else {
+                telemetry.addData("TagOfInterest", tagOfInterest == null ? "None" : tagOfInterest);
+            }
+            telemetry.update();
+            sleep(200);
+        }
+
+        waitForStart();
+
+        if (isStopRequested()) return;
+
+        // Autonomous sequence: spin up, shoot 3 times, then drive forward 12 inches
+
+        // Determine whether to shoot based on AprilTag distance
+        boolean canShoot = true;
+        if (tagOfInterest != null && cameraPipeline != null) {
+            java.util.List<AprilTagDetectionPipeline.Detection> detections = cameraPipeline.getLatestDetections();
+            AprilTagDetectionPipeline.Detection found = null;
+            for (AprilTagDetectionPipeline.Detection d : detections) {
+                if (d.id == tagOfInterest) {
+                    found = d;
+                    break;
+                }
+            }
+
+            double distanceMeters = Double.NaN;
+            if (found != null && found.translation != null && found.translation.length >= 3) {
+                double tx = found.translation[0];
+                double ty = found.translation[1];
+                double tz = found.translation[2];
+                distanceMeters = Math.sqrt(tx*tx + ty*ty + tz*tz);
+                telemetry.addData("TagDistance_m", "%.3f", distanceMeters);
+
+                if (distanceMeters < MIN_LAUNCH_DISTANCE_METERS) {
+                    // Need to back up until we're at least MIN_LAUNCH_DISTANCE_METERS away.
+                    double deltaMeters = MIN_LAUNCH_DISTANCE_METERS - distanceMeters;
+                    double deltaInches = deltaMeters / 0.0254; // meters to inches
+                    telemetry.addData("Launch", "Tag too close (%.2fm). Backing up %.2fin", distanceMeters, deltaInches);
+                    telemetry.update();
+
+                    int attempts = 0;
+                    // Try up to 3 times to back away and re-check
+                    while (distanceMeters < MIN_LAUNCH_DISTANCE_METERS && attempts < 3 && opModeIsActive()) {
+                        double moveInches = deltaInches + 2.0; // add a small buffer
+                        double timeout = Math.max(2.0, Math.abs(moveInches) / 5.0);
+                        driveStraight(-moveInches, 0.5, timeout); // negative -> back up
+                        sleep(300);
+
+                        // Re-query detections and compute new distance if available
+                        detections = cameraPipeline.getLatestDetections();
+                        found = null;
+                        for (AprilTagDetectionPipeline.Detection d : detections) {
+                            if (d.id == tagOfInterest) {
+                                found = d;
+                                break;
+                            }
+                        }
+                        if (found != null && found.translation != null && found.translation.length >= 3) {
+                            double tx2 = found.translation[0];
+                            double ty2 = found.translation[1];
+                            double tz2 = found.translation[2];
+                            distanceMeters = Math.sqrt(tx2*tx2 + ty2*ty2 + tz2*tz2);
+                            telemetry.addData("TagDistance_m_after", "%.3f", distanceMeters);
+                            telemetry.update();
+                            if (distanceMeters >= MIN_LAUNCH_DISTANCE_METERS) break;
+                            deltaMeters = MIN_LAUNCH_DISTANCE_METERS - distanceMeters;
+                            deltaInches = deltaMeters / 0.0254;
+                        } else {
+                            // If we lost the tag, break and fall back to default behavior
+                            telemetry.addData("Launch", "Lost tag after backing up; will proceed conservatively");
+                            telemetry.update();
+                            break;
+                        }
+                        attempts++;
+                    }
+
+                    if (distanceMeters < MIN_LAUNCH_DISTANCE_METERS) {
+                        telemetry.addData("Launch", "Could not reach min distance after attempts; skipping shots");
+                        telemetry.update();
+                        canShoot = false;
+                    }
+                }
+            } else {
+                telemetry.addData("Launch", "No pose data for tag; proceeding to shoot by default");
+                telemetry.update();
+            }
+        }
+
+        if (canShoot) {
+            // 1) Spin up launcher at full power and wait until velocities stabilize
+            double spinPower = 1.0;
+            long spinTimeoutMs = 3000; // max wait for spin-up
+            double stabilityThreshold = 20.0; // ticks/sec change threshold between samples
+            int stableRequiredCount = 3; // number of consecutive stable samples required
+
+            boolean spun = spinUpLaunchersAndWait(spinPower, spinTimeoutMs, stabilityThreshold, stableRequiredCount);
+            if (!spun) {
+                telemetry.addData("Launcher", "Did not reach stable velocity in time; skipping feeding");
+                telemetry.update();
+                stopLaunchers();
+            } else {
+                // 2) Fire 3 rings/balls by pulsing the feeder
+                for (int i = 0; i < 3 && opModeIsActive(); i++) {
+                    // Show launcher RPMs while feeding so drivers can monitor
+                    double vTopNow = launcherTop.getVelocity();
+                    double vBottomNow = launcherBottom.getVelocity();
+                    double rpmTopNow = vTopNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    double rpmBottomNow = vBottomNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    telemetry.addData("Feeding", "shot %d", i+1);
+                    telemetry.addData("RPMTop", "%.1f", rpmTopNow);
+                    telemetry.addData("RPMBottom", "%.1f", rpmBottomNow);
+                    telemetry.update();
+
+                    feeder.setPower(0.9);
+                    sleep(500); // feed duration (tune to reliably feed one projectile)
+                    feeder.setPower(0.0);
+                    // Update RPMs after feeding pulse
+                    vTopNow = launcherTop.getVelocity();
+                    vBottomNow = launcherBottom.getVelocity();
+                    rpmTopNow = vTopNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    rpmBottomNow = vBottomNow * 60.0 / TICKS_PER_MOTOR_REV;
+                    telemetry.addData("PostFeedRPMTop", "%.1f", rpmTopNow);
+                    telemetry.addData("PostFeedRPMBottom", "%.1f", rpmBottomNow);
+                    telemetry.update();
+
+                    sleep(300); // pause between feeds
+                }
+
+                // 3) Stop launcher and feeder
+                stopLaunchers();
+                feeder.setPower(0.0);
+            }
+        } else {
+            // If we decided not to shoot, report and continue
+            telemetry.addData("Auto", "Skipping shots due to close tag or failure to back up");
+            telemetry.update();
+        }
+
+        // 4) Drive forward 12 inches to move off the line / to a parking zone
+        driveStraight(12.0, 0.6, 4.0); // 12 inches forward
+
+        telemetry.addData("Auto", "Complete");
+        telemetry.update();
+    }
+
+    // ----------------- Helper movement methods -----------------
+
+    private void driveStraight(double inches, double power, double timeoutSec) {
+        int moveCounts = (int) Math.round(inches * COUNTS_PER_INCH);
+
+        int flTarget = frontLeft.getCurrentPosition() + moveCounts;
+        int frTarget = frontRight.getCurrentPosition() + moveCounts;
+        int blTarget = backLeft.getCurrentPosition() + moveCounts;
+        int brTarget = backRight.getCurrentPosition() + moveCounts;
+
+        frontLeft.setTargetPosition(flTarget);
+        frontRight.setTargetPosition(frTarget);
+        backLeft.setTargetPosition(blTarget);
+        backRight.setTargetPosition(brTarget);
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        frontRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        backLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        backRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+
+        frontLeft.setPower(Math.abs(power));
+        frontRight.setPower(Math.abs(power));
+        backLeft.setPower(Math.abs(power));
+        backRight.setPower(Math.abs(power));
+
+        runtime.reset();
+        while (opModeIsActive() && (runtime.seconds() < timeoutSec) &&
+                (frontLeft.isBusy() || frontRight.isBusy() || backLeft.isBusy() || backRight.isBusy())) {
+            telemetry.addData("Driving", "%.2f in", inches);
+            telemetry.update();
+        }
+
+        stopDriveMotors();
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        frontRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+    }
+
+    private void strafeRight(double inches, double power, double timeoutSec) {
+        // For mecanum strafing, wheel directions differ
+        int moveCounts = (int) Math.round(inches * COUNTS_PER_INCH);
+
+        int flTarget = frontLeft.getCurrentPosition() + moveCounts;
+        int frTarget = frontRight.getCurrentPosition() - moveCounts;
+        int blTarget = backLeft.getCurrentPosition() - moveCounts;
+        int brTarget = backRight.getCurrentPosition() + moveCounts;
+
+        frontLeft.setTargetPosition(flTarget);
+        frontRight.setTargetPosition(frTarget);
+        backLeft.setTargetPosition(blTarget);
+        backRight.setTargetPosition(brTarget);
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        frontRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        backLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        backRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+
+        frontLeft.setPower(Math.abs(power));
+        frontRight.setPower(Math.abs(power));
+        backLeft.setPower(Math.abs(power));
+        backRight.setPower(Math.abs(power));
+
+        runtime.reset();
+        while (opModeIsActive() && (runtime.seconds() < timeoutSec) &&
+                (frontLeft.isBusy() || frontRight.isBusy() || backLeft.isBusy() || backRight.isBusy())) {
+            telemetry.addData("Strafing", "%.2f in", inches);
+            telemetry.update();
+        }
+
+        stopDriveMotors();
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        frontRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+    }
+
+    private void rotateDegrees(double degrees, double power, double timeoutSec) {
+        // Positive degrees -> turn right, negative -> turn left
+        double turnCircumference = Math.PI * TRACK_WIDTH_INCHES; // circumference traced by each wheel
+        double inchesToMove = (turnCircumference * Math.abs(degrees)) / 360.0;
+        int moveCounts = (int) Math.round(inchesToMove * COUNTS_PER_INCH);
+
+        int flTarget = frontLeft.getCurrentPosition() + (degrees > 0 ? moveCounts : -moveCounts);
+        int frTarget = frontRight.getCurrentPosition() - (degrees > 0 ? moveCounts : -moveCounts);
+        int blTarget = backLeft.getCurrentPosition() + (degrees > 0 ? moveCounts : -moveCounts);
+        int brTarget = backRight.getCurrentPosition() - (degrees > 0 ? moveCounts : -moveCounts);
+
+        frontLeft.setTargetPosition(flTarget);
+        frontRight.setTargetPosition(frTarget);
+        backLeft.setTargetPosition(blTarget);
+        backRight.setTargetPosition(brTarget);
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        frontRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        backLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        backRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+
+        frontLeft.setPower(Math.abs(power));
+        frontRight.setPower(Math.abs(power));
+        backLeft.setPower(Math.abs(power));
+        backRight.setPower(Math.abs(power));
+
+        runtime.reset();
+        while (opModeIsActive() && (runtime.seconds() < timeoutSec) &&
+                (frontLeft.isBusy() || frontRight.isBusy() || backLeft.isBusy() || backRight.isBusy())) {
+            telemetry.addData("Turning", "%.1f deg", degrees);
+            telemetry.update();
+        }
+
+        stopDriveMotors();
+
+        frontLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        frontRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backLeft.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        backRight.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+    }
+
+    private void stopDriveMotors() {
+        frontLeft.setPower(0);
+        frontRight.setPower(0);
+        backLeft.setPower(0);
+        backRight.setPower(0);
+    }
+
+    // ----------------- Launcher / Feeder helpers -----------------
+
+    private void spinUpLaunchers(double power) {
+        // Launcher motors have no gearbox and must run near max to launch
+            launcherTop.setPower(power);
+            launcherBottom.setPower(power);
+    }
+
+    /**
+     * Spin up launchers and wait until their encoder-reported velocity stabilizes.
+     * This does not require an absolute target RPM; it waits until consecutive
+     * velocity samples change by less than `stabilityThresholdTicksPerSec`.
+     * Returns true if stable within timeout, false otherwise.
+     */
+    private boolean spinUpLaunchersAndWait(double power, long timeoutMs, double stabilityThresholdTicksPerSec, int stableRequiredCount) {
+        launcherTop.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        launcherBottom.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+
+        // Convert launcher target RPM to encoder ticks/sec
+        double targetTicksPerSec = (LAUNCHER_TARGET_RPM / 60.0) * TICKS_PER_MOTOR_REV;
+
+        // Command the motors by velocity for a more consistent spin-up
+        try {
+            launcherTop.setVelocity(targetTicksPerSec);
+            launcherBottom.setVelocity(targetTicksPerSec);
+        } catch (Exception e) {
+            // Fallback: if setVelocity is not supported, use setPower
+            launcherTop.setPower(power);
+            launcherBottom.setPower(power);
+        }
+
+        ElapsedTime waitTimer = new ElapsedTime();
+        double prevVTop = launcherTop.getVelocity();
+        double prevVBottom = launcherBottom.getVelocity();
+        int stableCount = 0;
+
+        // We'll wait until velocities are both near the target (within tolerance)
+        double toleranceTicks = Math.max(stabilityThresholdTicksPerSec, targetTicksPerSec * 0.05); // 5% or stability threshold
+
+        while (opModeIsActive() && waitTimer.milliseconds() < timeoutMs) {
+            sleep(120);
+            double vTop = launcherTop.getVelocity();
+            double vBottom = launcherBottom.getVelocity();
+
+            double dvTop = Math.abs(vTop - prevVTop);
+            double dvBottom = Math.abs(vBottom - prevVBottom);
+
+            double errTop = Math.abs(vTop - targetTicksPerSec);
+            double errBottom = Math.abs(vBottom - targetTicksPerSec);
+
+            // Convert ticks/sec -> RPM for driver-friendly display
+            double rpmTop = vTop * 60.0 / TICKS_PER_MOTOR_REV;
+            double rpmBottom = vBottom * 60.0 / TICKS_PER_MOTOR_REV;
+
+            telemetry.addData("LauncherVelTop", "%.1f t/s", vTop);
+            telemetry.addData("LauncherVelBottom", "%.1f t/s", vBottom);
+            telemetry.addData("LauncherRPMTop", "%.1f rpm", rpmTop);
+            telemetry.addData("LauncherRPMBottom", "%.1f rpm", rpmBottom);
+            telemetry.addData("ErrTop", "%.1f", errTop);
+            telemetry.addData("ErrBottom", "%.1f", errBottom);
+            telemetry.addData("DeltaTop", "%.2f", dvTop);
+            telemetry.addData("DeltaBottom", "%.2f", dvBottom);
+            telemetry.update();
+
+            // Consider stable when both near target and changes are small
+            if (errTop < toleranceTicks && errBottom < toleranceTicks &&
+                    dvTop < stabilityThresholdTicksPerSec && dvBottom < stabilityThresholdTicksPerSec) {
+                stableCount++;
+                if (stableCount >= stableRequiredCount) {
+                    return true;
+                }
+            } else {
+                stableCount = 0;
+            }
+
+            prevVTop = vTop;
+            prevVBottom = vBottom;
+        }
+
+        return false;
+    }
+
+    private void stopLaunchers() {
+            launcherTop.setPower(0.0);
+            launcherBottom.setPower(0.0);
+        }
+    // ----------------- AprilTag detection pipeline (OpenFTC-compatible stub) -----------------
+    // This class provides the same public API as OpenFTC's pipeline. If you
+    // add the OpenFTC AprilTag detection library to your project, their
+    // pipeline can be used instead. This stub will return an empty list of
+    // detections unless the third-party AprilTag detector is available.
+    private static class AprilTagDetectionPipeline extends OpenCvPipeline {
+        private final double tagsize;
+        private final double fx, fy, cx, cy;
+        private volatile java.util.List<Detection> latestDetections = new java.util.ArrayList<>();
+
+        public AprilTagDetectionPipeline(double tagsize, double fx, double fy, double cx, double cy) {
+            this.tagsize = tagsize;
+            this.fx = fx;
+            this.fy = fy;
+            this.cx = cx;
+            this.cy = cy;
+        }
+
+        @Override
+        public Mat processFrame(Mat input) {
+            // Default stub: do not detect tags, just return the frame.
+            // If you add OpenFTC's AprilTagDetectionPipeline, replace this class
+            // or modify it to call the native detector and populate latestDetections.
+            latestDetections = java.util.Collections.emptyList();
+            return input;
+        }
+
+        public java.util.List<Detection> getLatestDetections() {
+            return latestDetections;
+        }
+
+        // Simple detection container matching OpenFTC's API shape
+        public static class Detection {
+            public final int id;
+            public final double[] translation; // x,y,z meters
+            public final double[] rotation; // yaw,pitch,roll radians
+
+            public Detection(int id, double[] translation, double[] rotation) {
+                this.id = id;
+                this.translation = translation;
+                this.rotation = rotation;
+            }
+        }
+    }
+    }
+
+}
